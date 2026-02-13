@@ -165,7 +165,7 @@ clean_project_caches() {
             -not -path "*/Library/*" \
             -not -path "*/.Trash/*" \
             -not -path "*/node_modules/*" \
-            -not -path "*/.git/*" \
+            -not -path "*/.*" \
             2> /dev/null || true
     ) > "$nextjs_tmp_file" 2>&1 &
     local next_pid=$!
@@ -183,7 +183,7 @@ clean_project_caches() {
             -not -path "*/Library/*" \
             -not -path "*/.Trash/*" \
             -not -path "*/node_modules/*" \
-            -not -path "*/.git/*" \
+            -not -path "*/.*" \
             -not -path "*/.fvm/*" \
             2> /dev/null || true
     ) > "$flutter_tmp_file" 2>&1 &
