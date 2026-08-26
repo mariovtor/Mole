@@ -567,3 +567,60 @@ EOF
     fi
     [ "$status" -eq 0 ]
 }
+
+@test "whitelist row stops the Shorebird Flutter revision cleanup" {
+    local pin="65b1e4368e98a85ea11e8ef2cffc286c3b2ad8b2"
+    local stale="0ac69de92c7201830d6a687a44fa0d34f6003f90"
+    local flutter_root="$HOME/.shorebird/bin/cache/flutter"
+
+    seed_shorebird() {
+        rm -rf "$HOME/.shorebird"
+        mkdir -p "$HOME/.shorebird/bin/internal" "$flutter_root/$pin" "$flutter_root/$stale"
+        printf '%s\n' "$pin" > "$HOME/.shorebird/bin/internal/flutter.version"
+        printf 'engine\n' > "$flutter_root/$stale/version"
+    }
+
+    # Positive control: without the whitelist the revision really is deleted,
+    # so the negative assertion below cannot pass vacuously.
+    seed_shorebird
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+shorebird_process_state() { return 1; }
+clean_shorebird_flutter_revisions
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ ! -e "$flutter_root/$stale" ] || { echo "control run did not delete"; return 1; }
+
+    # Same fixture with the inventory row saved. should_protect_path does not
+    # cover ~/.shorebird, so this row is the only opt-out.
+    seed_shorebird
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+source "$PROJECT_ROOT/lib/manage/whitelist.sh"
+shorebird_pattern=""
+while IFS='|' read -r name pattern _; do
+    if [[ "$name" == "Shorebird Flutter old revisions" ]]; then
+        shorebird_pattern="$pattern"
+        break
+    fi
+done < <(get_all_cache_items)
+# The row lives in the static inventory table, so $HOME reaches here
+# unexpanded; save_whitelist_patterns/load_mole_whitelist expand it.
+[[ "$shorebird_pattern" == '$HOME/.shorebird/bin/cache/flutter/*' ]] || exit 1
+save_whitelist_patterns "$shorebird_pattern"
+load_mole_whitelist "$HOME"
+DRY_RUN=false
+shorebird_process_state() { return 1; }
+clean_shorebird_flutter_revisions
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -d "$flutter_root/$stale" ] || return 1
+    [ -d "$flutter_root/$pin" ] || return 1
+    [[ "$output" != *"Shorebird Flutter old revisions"* ]] || return 1
+}
