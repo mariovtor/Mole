@@ -126,6 +126,7 @@ MyPy type checker cache|$HOME/.cache/mypy/*|compiler_cache
 Pytest test cache|$HOME/.pytest_cache/*|compiler_cache
 PyInstaller binary cache|$HOME/Library/Application Support/pyinstaller/bincache*|compiler_cache
 Flutter SDK cache|$HOME/.cache/flutter/*|compiler_cache
+Shorebird Flutter old revisions|$HOME/.shorebird/bin/cache/flutter/*|compiler_cache
 Swift Package Manager cache|$HOME/.cache/swift-package-manager/*|compiler_cache
 Zig compiler cache|$HOME/.cache/zig/*|compiler_cache
 CocoaPods cache (iOS dependencies)|$HOME/Library/Caches/CocoaPods/*|package_manager

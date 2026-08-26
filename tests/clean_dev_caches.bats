@@ -3190,3 +3190,405 @@ EOF
 	[[ "$output" != *"STALE_DESPITE_AMBIGUOUS_INSTALL"* ]] || return 1
 	[[ "$output" == *"STALE_WITH_STABLE_INSTALL"* ]] || return 1
 }
+
+# Shorebird fixture: bin/internal/flutter.version plus one directory per
+# revision under bin/cache/flutter. An empty pin leaves the version file out.
+seed_shorebird_install() {
+    local pin="$1"
+    shift
+    rm -rf "$HOME/.shorebird"
+    mkdir -p "$HOME/.shorebird/bin/internal" "$HOME/.shorebird/bin/cache/flutter"
+    if [[ -n "$pin" ]]; then
+        printf '%s\n' "$pin" > "$HOME/.shorebird/bin/internal/flutter.version"
+    fi
+    local revision
+    for revision in "$@"; do
+        mkdir -p "$HOME/.shorebird/bin/cache/flutter/$revision"
+    done
+}
+
+@test "Shorebird cleanup keeps the pinned Flutter revision and prunes the others" {
+    local flutter_root="$HOME/.shorebird/bin/cache/flutter"
+    local pin="65b1e4368e98a85ea11e8ef2cffc286c3b2ad8b2"
+    # Starts with a letter on purpose: the versioned-agent pruner next door
+    # filters on ^[0-9], which would make this revision invisible.
+    local stale_letter="a4892267d519d491b0138117a9ae0ef2807fe109"
+    local stale_digit="0ac69de92c7201830d6a687a44fa0d34f6003f90"
+    seed_shorebird_install "$pin" "$pin" "$stale_letter" "$stale_digit"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+shorebird_process_state() { return 1; }
+safe_clean() {
+    local description="${!#}"
+    while [[ $# -gt 1 ]]; do
+        printf 'CLEAN=%s|%s\n' "$description" "$1"
+        shift
+    done
+}
+clean_shorebird_flutter_revisions
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"CLEAN=Shorebird Flutter old revisions|$flutter_root/$stale_letter"* ]] || return 1
+    [[ "$output" == *"CLEAN=Shorebird Flutter old revisions|$flutter_root/$stale_digit"* ]] || return 1
+    [[ "$output" != *"$flutter_root/$pin"* ]]
+}
+
+@test "Shorebird cleanup only prunes 40-hex revision directories" {
+    local cache_root="$HOME/.shorebird/bin/cache"
+    local flutter_root="$cache_root/flutter"
+    local outside_root="$HOME/outside-shorebird"
+    local pin="65b1e4368e98a85ea11e8ef2cffc286c3b2ad8b2"
+    local stale="0ac69de92c7201830d6a687a44fa0d34f6003f90"
+    seed_shorebird_install "$pin" "$pin" "$stale"
+    rm -rf "$outside_root"
+    mkdir -p "$outside_root"
+    printf 'keep\n' > "$outside_root/private-data"
+    # All of these share the root with the revisions and must survive.
+    mkdir -p "$flutter_root/not-a-sha"
+    mkdir -p "$flutter_root/a4892267d519d491b0138117a9ae0ef2807fe10"
+    mkdir -p "$flutter_root/A4892267D519D491B0138117A9AE0EF2807FE109"
+    printf 'file\n' > "$flutter_root/1c01b329708b9975c37932543355851a4a2dd23d"
+    ln -s "$outside_root" "$flutter_root/2e1bcd18e2dc3b8251dc0671085c6518d37e16ad"
+    mkdir -p "$cache_root/artifacts" "$cache_root/previews"
+    printf 'snapshot\n' > "$cache_root/shorebird.snapshot"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+shorebird_process_state() { return 1; }
+safe_clean() {
+    local description="${!#}"
+    while [[ $# -gt 1 ]]; do
+        printf 'CLEAN=%s|%s\n' "$description" "$1"
+        shift
+    done
+}
+clean_shorebird_flutter_revisions
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"CLEAN=Shorebird Flutter old revisions|$flutter_root/$stale"* ]] || return 1
+    [[ "$output" != *"not-a-sha"* ]] || return 1
+    [[ "$output" != *"a4892267d519d491b0138117a9ae0ef2807fe10"* ]] || return 1
+    [[ "$output" != *"A4892267"* ]] || return 1
+    [[ "$output" != *"1c01b329708b9975c37932543355851a4a2dd23d"* ]] || return 1
+    [[ "$output" != *"2e1bcd18e2dc3b8251dc0671085c6518d37e16ad"* ]] || return 1
+    [[ "$output" != *"artifacts"* ]] || return 1
+    [[ "$output" != *"previews"* ]] || return 1
+    [[ "$output" != *"shorebird.snapshot"* ]] || return 1
+    [ -f "$outside_root/private-data" ]
+}
+
+@test "Shorebird cleanup stops when the pinned revision cannot be read" {
+    local pin_file="$HOME/.shorebird/bin/internal/flutter.version"
+    local stale_a="0ac69de92c7201830d6a687a44fa0d34f6003f90"
+    local stale_b="a4892267d519d491b0138117a9ae0ef2807fe109"
+    local content
+    # Without a readable pin there is no evidence about any sibling, so every
+    # revision survives. The last entry is why the pin is read with `read`
+    # and not `head | tr -d '[:space:]'`: stripping the space would glue those
+    # two tokens into exactly $stale_a, keeping the wrong directory.
+    for content in \
+        '<missing>' \
+        '' \
+        '0ac69de92c7201830d6a687a44fa0d34f6003f9' \
+        '0AC69DE92C7201830D6A687A44FA0D34F6003F90' \
+        'not-a-revision' \
+        '0ac69de9 2c7201830d6a687a44fa0d34f6003f90'; do
+        seed_shorebird_install "" "$stale_a" "$stale_b"
+        if [[ "$content" != '<missing>' ]]; then
+            printf '%s\n' "$content" > "$pin_file"
+        fi
+
+        run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+shorebird_process_state() { return 1; }
+safe_clean() { printf 'UNEXPECTED_CLEAN=%s\n' "$1"; }
+note_activity() { :; }
+clean_shorebird_flutter_revisions
+EOF
+
+        [ "$status" -eq 0 ] || { echo "$content: $output"; return 1; }
+        [[ "$output" == *"Shorebird Flutter old revisions · stopped (current revision unknown)"* ]] || {
+            echo "$content: $output"
+            return 1
+        }
+        [[ "$output" != *"UNEXPECTED_CLEAN="* ]] || {
+            echo "$content: $output"
+            return 1
+        }
+    done
+}
+
+@test "Shorebird cleanup defers the family while Shorebird is running" {
+    local pin="65b1e4368e98a85ea11e8ef2cffc286c3b2ad8b2"
+    seed_shorebird_install "$pin" "$pin" "0ac69de92c7201830d6a687a44fa0d34f6003f90"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+shorebird_process_state() { return 0; }
+mole_defer_cleanup_family() { printf 'DEFER=%s\n' "$1"; }
+safe_clean() { printf 'UNEXPECTED_CLEAN=%s\n' "$1"; }
+note_activity() { :; }
+clean_shorebird_flutter_revisions
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"DEFER=Shorebird"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_CLEAN="* ]]
+}
+
+@test "Shorebird cleanup fails closed when the process state is unknown" {
+    local pin="65b1e4368e98a85ea11e8ef2cffc286c3b2ad8b2"
+    seed_shorebird_install "$pin" "$pin" "0ac69de92c7201830d6a687a44fa0d34f6003f90"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+shorebird_process_state() { return 2; }
+safe_clean() { printf 'UNEXPECTED_CLEAN=%s\n' "$1"; }
+note_activity() { :; }
+clean_shorebird_flutter_revisions
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Shorebird Flutter old revisions · stopped (process state unknown)"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_CLEAN="* ]]
+}
+
+@test "Shorebird cleanup rechecks the pinned revision at the deletion boundary" {
+    local pin="65b1e4368e98a85ea11e8ef2cffc286c3b2ad8b2"
+    local stale="0ac69de92c7201830d6a687a44fa0d34f6003f90"
+    local new_pin
+    # `shorebird upgrade` can move the pin onto a directory already queued for
+    # deletion. Rewriting it to junk is the same class of evidence loss.
+    for new_pin in "$stale" "not-a-revision"; do
+        seed_shorebird_install "$pin" "$pin" "$stale"
+
+        run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" NEW_PIN="$new_pin" \
+            /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+shorebird_process_state() { return 1; }
+safe_clean() { printf 'UNEXPECTED_CLEAN=%s\n' "$1"; }
+safe_clean_guarded() {
+    local guard="$1"
+    shift
+    printf '%s\n' "$NEW_PIN" > "$HOME/.shorebird/bin/internal/flutter.version"
+    "$guard" "$1" || return 75
+    safe_clean "$@"
+}
+note_activity() { :; }
+clean_shorebird_flutter_revisions
+EOF
+
+        [ "$status" -eq 0 ] || { echo "$new_pin: $output"; return 1; }
+        [[ "$output" == *"Shorebird Flutter old revisions · stopped (process or cache path state unknown)"* ]] || {
+            echo "$new_pin: $output"
+            return 1
+        }
+        [[ "$output" != *"UNEXPECTED_CLEAN="* ]] || {
+            echo "$new_pin: $output"
+            return 1
+        }
+    done
+}
+
+@test "Shorebird cleanup stays silent when there is nothing to prune" {
+    local pin="65b1e4368e98a85ea11e8ef2cffc286c3b2ad8b2"
+
+    rm -rf "$HOME/.shorebird"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+safe_clean() { printf 'UNEXPECTED_CLEAN=%s\n' "$1"; }
+note_activity() { :; }
+clean_shorebird_flutter_revisions
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ -z "$output" ]] || { echo "$output"; return 1; }
+
+    # Same for a root holding only the pin, and for an unreadable pin with no
+    # sibling to argue about.
+    seed_shorebird_install "$pin" "$pin"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+shorebird_process_state() { return 1; }
+safe_clean() { printf 'UNEXPECTED_CLEAN=%s\n' "$1"; }
+note_activity() { :; }
+clean_shorebird_flutter_revisions
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ -z "$output" ]] || { echo "$output"; return 1; }
+
+    seed_shorebird_install "" "$pin"
+    rm -rf "$HOME/.shorebird/bin/cache/flutter/$pin"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+shorebird_process_state() { return 1; }
+safe_clean() { printf 'UNEXPECTED_CLEAN=%s\n' "$1"; }
+note_activity() { :; }
+clean_shorebird_flutter_revisions
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ -z "$output" ]]
+}
+
+@test "Shorebird cleanup propagates a timed-out inventory scan" {
+    local pin="65b1e4368e98a85ea11e8ef2cffc286c3b2ad8b2"
+    local stale="0ac69de92c7201830d6a687a44fa0d34f6003f90"
+    seed_shorebird_install "$pin" "$pin" "$stale"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+run_with_timeout() { return 124; }
+shorebird_process_state() { return 1; }
+safe_clean() { printf 'UNEXPECTED_CLEAN=%s\n' "$1"; }
+note_activity() { :; }
+set +e
+clean_shorebird_flutter_revisions
+rc=$?
+set -e
+printf 'RC:%s\n' "$rc"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC:124"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_CLEAN="* ]] || return 1
+    [ -d "$HOME/.shorebird/bin/cache/flutter/$stale" ]
+}
+
+@test "Shorebird cleanup names the cause when the inventory cannot be built" {
+    local pin="65b1e4368e98a85ea11e8ef2cffc286c3b2ad8b2"
+    local stale="0ac69de92c7201830d6a687a44fa0d34f6003f90"
+    seed_shorebird_install "$pin" "$pin" "$stale"
+
+    # A silent skip here would read as "Shorebird had nothing to clean".
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+create_temp_file() { return 1; }
+shorebird_process_state() { return 1; }
+safe_clean() { printf 'UNEXPECTED_CLEAN=%s\n' "$1"; }
+note_activity() { :; }
+clean_shorebird_flutter_revisions
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Shorebird Flutter old revisions · stopped (inventory unknown)"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_CLEAN="* ]] || return 1
+    [ -d "$HOME/.shorebird/bin/cache/flutter/$stale" ]
+}
+
+@test "Shorebird cleanup reaches the guarded deletion sink" {
+    local flutter_root="$HOME/.shorebird/bin/cache/flutter"
+    local pin="65b1e4368e98a85ea11e8ef2cffc286c3b2ad8b2"
+    local stale="0ac69de92c7201830d6a687a44fa0d34f6003f90"
+    seed_shorebird_install "$pin" "$pin" "$stale"
+    printf 'engine\n' > "$flutter_root/$stale/version"
+    printf 'engine\n' > "$flutter_root/$pin/version"
+    printf 'snapshot\n' > "$HOME/.shorebird/bin/cache/shorebird.snapshot"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+shorebird_process_state() { return 1; }
+clean_shorebird_flutter_revisions
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ ! -e "$flutter_root/$stale" ] || return 1
+    [ -f "$flutter_root/$pin/version" ] || return 1
+    [ -f "$HOME/.shorebird/bin/internal/flutter.version" ] || return 1
+    [ -f "$HOME/.shorebird/bin/cache/shorebird.snapshot" ]
+}
+
+@test "Shorebird dry run previews the revisions the real run would delete" {
+    local flutter_root="$HOME/.shorebird/bin/cache/flutter"
+    local pin="65b1e4368e98a85ea11e8ef2cffc286c3b2ad8b2"
+    local stale="0ac69de92c7201830d6a687a44fa0d34f6003f90"
+    seed_shorebird_install "$pin" "$pin" "$stale"
+    printf 'engine\n' > "$flutter_root/$stale/version"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=true
+shorebird_process_state() { return 1; }
+clean_shorebird_flutter_revisions
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    # The label alone is not evidence of a preview: every refusal row carries
+    # it too and also leaves both directories on disk.
+    [[ "$output" == *"Shorebird Flutter old revisions"*"dry"* ]] || return 1
+    [[ "$output" != *"stopped ("* ]] || return 1
+    [ -d "$flutter_root/$stale" ] || return 1
+    [ -d "$flutter_root/$pin" ]
+}
+
+@test "shorebird_process_state matches Shorebird tooling but not Mole's own probes" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+patterns=()
+mole_pgrep_any() {
+    while [[ $# -gt 0 ]]; do
+        [[ "$1" != "-f" ]] || patterns+=("$2")
+        shift 2
+    done
+    return 1
+}
+# The stub reports "not running", so the call itself is a tested command.
+shorebird_process_state || true
+[[ ${#patterns[@]} -gt 0 ]] || exit 1
+
+matches() {
+    local line="$1"
+    local pattern
+    for pattern in "${patterns[@]}"; do
+        if printf '%s\n' "$line" | LC_ALL=C command grep -Eq "$pattern"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+sb="/Users/tester/.shorebird"
+rev="65b1e4368e98a85ea11e8ef2cffc286c3b2ad8b2"
+# Launcher, CLI snapshot and a build's dart: all three must vote.
+matches "/bin/bash $sb/bin/shorebird release android" || exit 1
+matches "$sb/bin/cache/flutter/$rev/bin/cache/dart-sdk/bin/dartaotruntime $sb/bin/cache/shorebird.snapshot patch" || exit 1
+matches "$sb/bin/cache/flutter/$rev/bin/dart --disable-dart-dev run" || exit 1
+# pgrep also sees the tools Mole forks over these candidates. Neither may vote.
+! matches "du -skP $sb/bin/cache/flutter/$rev" || exit 1
+! matches "find $sb/bin/cache/flutter -mindepth 1 -maxdepth 1 -print0" || exit 1
+echo PATTERNS_OK
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"PATTERNS_OK"* ]]
+}

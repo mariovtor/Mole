@@ -764,6 +764,140 @@ clean_clang_module_cache() {
         "${candidates[@]}"
 }
 
+# Is any Shorebird tooling live? 0 running, 1 not, 2 could not tell.
+#
+# Matches paths, not process names: the launcher is a bash script and the CLI
+# runs as `dartvm .../shorebird.snapshot`. Keep every pattern narrower than a
+# bare `/.shorebird/` -- mole_pgrep_any calls pgrep directly rather than the
+# self-filtered _mole_process_table, and Mole forks `du -skP <revision dir>`
+# over these same candidates while sizing them.
+shorebird_process_state() {
+    mole_pgrep_any \
+        -x shorebird \
+        -f "/[.]shorebird/bin/shorebird" \
+        -f "/[.]shorebird/bin/cache/shorebird[.]snapshot" \
+        -f "/[.]shorebird/bin/cache/flutter/[0-9a-f]*/bin/"
+}
+
+# The revision the launcher runs by default: first line of
+# bin/internal/flutter.version, a 40-hex lowercase git SHA. Read with `read`
+# rather than `head | tr -d '[:space:]'` on purpose -- stripping whitespace
+# would glue a corrupt two-token line into a valid-looking SHA. Anything that
+# is not exactly that SHA returns 1, which keeps every revision.
+_shorebird_current_flutter_revision() {
+    local version_file="$HOME/.shorebird/bin/internal/flutter.version"
+    [[ -f "$version_file" && ! -L "$version_file" ]] || return 1
+
+    local revision=""
+    IFS= read -r revision < "$version_file" 2> /dev/null || true
+    revision="${revision%$'\r'}"
+    [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || return 1
+
+    printf '%s\n' "$revision"
+}
+
+# Sink-time probe for clean_guarded_dev_cache_root: runs at the pre-flight
+# guard and again against each leaf at the deletion boundary.
+shorebird_cleanup_process_state() {
+    local process_state=0
+    shorebird_process_state || process_state=$?
+    [[ $process_state -eq 1 ]] || return "$process_state"
+
+    # `shorebird upgrade` can move the pin after the candidate list was
+    # planned, so re-read it and deny unless it still matches. That equality
+    # also covers the pin landing on a directory already queued for deletion.
+    # It does not cover which revisions a shipped release is bound to: that
+    # binding lives on the Shorebird server, so no local guard can check it.
+    local current_revision=""
+    if ! current_revision=$(_shorebird_current_flutter_revision); then
+        debug_log "Shorebird cleanup: pinned Flutter revision became unreadable"
+        return 2
+    fi
+    if [[ "$current_revision" != "${_MOLE_SHOREBIRD_PLANNED_REVISION:-}" ]]; then
+        debug_log "Shorebird cleanup: pinned Flutter revision changed since planning"
+        return 2
+    fi
+    return 1
+}
+
+# Shorebird clones a complete Flutter SDK per revision under
+# ~/.shorebird/bin/cache/flutter/<sha> (0.7-2.6 GB each) and never prunes
+# them. Measured on one install: 25 non-pinned revisions holding 49.5 GB.
+#
+# Retention is equality against bin/internal/flutter.version, never mtime --
+# two SDK clones have no ordering to compare, and Finder rewrites these
+# mtimes just by browsing the folder.
+#
+# That pin is the DEFAULT revision, moved only by `shorebird upgrade`, not a
+# use record: `shorebird release --flutter-version` and every `shorebird
+# patch` install their own revision through an in-memory override without
+# writing the file, and the release-to-revision binding lives on the
+# Shorebird server. Deleting a sibling therefore costs a re-clone plus
+# `flutter precache` the next time a patch targets the release bound to it.
+# That contract is the owner's own -- `shorebird cache clean` drops this
+# whole root including the pin -- so this stays strictly narrower than the
+# documented reset, and the whitelist row is the opt-out.
+clean_shorebird_flutter_revisions() {
+    local container_root="$HOME/.shorebird/bin/cache"
+    local cache_root="$container_root/flutter"
+    local display_name="Shorebird Flutter old revisions"
+    [[ -d "$cache_root" ]] || return 0
+
+    local scan_file=""
+    if ! scan_file=$(create_temp_file); then
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} ${display_name} · stopped (inventory unknown)"
+        note_activity
+        return 0
+    fi
+    local scan_rc=0
+    _materialize_versioned_agent_entries \
+        "$cache_root" "$scan_file" "$MOLE_TIMEOUT_DISK_VERIFY_SEC" || scan_rc=$?
+    if [[ $scan_rc -ne 0 ]]; then
+        rm -f -- "$scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
+        [[ $scan_rc -eq 124 || $scan_rc -ge 128 ]] && return "$scan_rc"
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} ${display_name} · stopped (inventory unknown)"
+        note_activity
+        return 0
+    fi
+
+    local current_revision=""
+    local current_known=true
+    current_revision=$(_shorebird_current_flutter_revision) || current_known=false
+
+    local -a candidates=()
+    local entry name
+    while IFS= read -r -d '' entry; do
+        name="${entry##*/}"
+        [[ "$name" =~ ^[0-9a-f]{40}$ ]] || continue
+        [[ "${entry%/*}" == "$cache_root" ]] || continue
+        [[ -d "$entry" && ! -L "$entry" ]] || continue
+        if [[ "$current_known" == true && "$name" == "$current_revision" ]]; then
+            continue
+        fi
+        candidates+=("$entry")
+    done < "$scan_file"
+    rm -f -- "$scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
+
+    [[ ${#candidates[@]} -gt 0 ]] || return 0
+
+    if [[ "$current_known" != true ]]; then
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} ${display_name} · stopped (current revision unknown)"
+        note_activity
+        return 0
+    fi
+
+    # Dynamically scoped: the sink-time probe reads it through the nested
+    # clean_guarded_dev_cache_root -> guarded_dev_cache_cleanup_state chain.
+    local _MOLE_SHOREBIRD_PLANNED_REVISION="$current_revision"
+    clean_guarded_dev_cache_root \
+        "$container_root" \
+        "$cache_root" \
+        shorebird_cleanup_process_state \
+        "Shorebird" \
+        "$display_name" \
+        "${candidates[@]}"
+}
+
 # Python/pip ecosystem caches.
 clean_dev_python() {
     # Check pip3 is functional (not just macOS stub that triggers CLT install dialog)
@@ -2950,6 +3084,9 @@ clean_dev_mobile() {
     safe_clean ~/Library/Caches/Google/AndroidStudio*/* "Android Studio cache"
     # safe_clean ~/Library/Caches/CocoaPods/* "CocoaPods cache"
     # safe_clean ~/.cache/flutter/* "Flutter cache"
+    # Non-pinned Shorebird Flutter SDK revisions; unlike the two Flutter/Dart
+    # stores kept off the delete path, these are re-clonable on demand.
+    clean_shorebird_flutter_revisions || return $?
     safe_clean ~/.android/build-cache/* "Android build cache"
     safe_clean ~/.android/cache/* "Android SDK cache"
     _xcode_safe_clean_guarded \
